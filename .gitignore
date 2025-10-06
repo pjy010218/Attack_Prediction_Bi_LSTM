@@ -1,0 +1,6 @@
+# Ignore Python virtual environment
+.venv/
+data/
+layers/
+models/
+*.json
