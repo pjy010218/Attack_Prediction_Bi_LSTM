@@ -4,3 +4,4 @@ data/
 layers/
 models/
 *.json
+(unnec)*.py
