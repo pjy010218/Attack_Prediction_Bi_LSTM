@@ -4,103 +4,130 @@ import glob
 import os
 from tqdm import tqdm
 
-def process_uwf_zeekdata_parquet(
+def process_uwf_smartly(
     input_folder: str,
     output_file: str,
-    min_sequence_length: int = 2
+    time_threshold_minutes: int = 30,  # 세션 분리 기준 (분)
+    window_size: int = 20,             # LSTM 입력 길이 (슬라이딩 윈도우)
+    stride: int = 5                    # 윈도우 이동 간격
 ):
-    """
-    UWF-ZeekData24의 Parquet 파일들을 병합하고 TTP 시퀀스를 추출합니다.
-    *수정사항: 제공된 26개 컬럼명을 반영 (label_technique, ts, src_ip_zeek 사용)
-    """
-    print(f"--- 1. 파일 탐색 시작: {input_folder} ---")
+    print(f"--- 1. 파일 탐색: {input_folder} ---")
     parquet_files = glob.glob(os.path.join(input_folder, "**", "*.parquet"), recursive=True)
-    
     if not parquet_files:
-        print("Error: 해당 경로에서 Parquet 파일을 찾을 수 없습니다.")
+        print("Error: Parquet 파일이 없습니다.")
         return
 
-    print(f"-> 총 {len(parquet_files)}개의 Parquet 파일을 찾았습니다.")
+    # 1. 컬럼 자동 감지 (이전과 동일)
+    sample_df = pd.read_parquet(parquet_files[0])
+    cols = sample_df.columns.tolist()
+    
+    # 컬럼 매핑
+    src_ip_col = next((c for c in ['src_ip_zeek', 'id.orig_h', 'src_ip', 'uid'] if c in cols), None)
+    ttp_col = next((c for c in ['label_technique', 'mitre_attck_technique'] if c in cols), None)
+    ts_col = next((c for c in ['ts', 'timestamp', 'datetime'] if c in cols), None)
 
-    # 2. 데이터 로드 및 병합
-    print("--- 2. 데이터 로드 및 병합 중... ---")
+    if not (src_ip_col and ttp_col and ts_col):
+        print(f"Fatal Error: 필수 컬럼(IP, TTP, Time)을 찾지 못했습니다. 감지된 컬럼: {cols}")
+        return
     
-    # [수정] 제공해주신 컬럼명 반영
-    # mission_id가 없으므로, 공격자 식별을 위해 'src_ip_zeek'를 사용합니다.
-    target_columns = [
-        'src_ip_zeek',      # 그룹화 기준 (공격자 IP)
-        'label_technique',  # TTP ID (핵심 데이터)
-        'ts'                # 정렬 기준 (타임스탬프)
-    ]
-    
+    print(f"-> 매핑 완료: IP[{src_ip_col}], TTP[{ttp_col}], Time[{ts_col}]")
+
+    # 2. 데이터 로드
+    print("--- 2. 데이터 로드 및 병합 ---")
     dfs = []
-    for file in tqdm(parquet_files, desc="파일 읽기"):
+    for file in tqdm(parquet_files):
         try:
-            # 필요한 컬럼만 읽어서 메모리 절약
-            df_chunk = pd.read_parquet(file, columns=target_columns)
+            df_chunk = pd.read_parquet(file, columns=[src_ip_col, ttp_col, ts_col])
             dfs.append(df_chunk)
-        except Exception as e:
-            # 해당 컬럼이 없는 파일은 건너뜀
-            pass
-            
-    if not dfs:
-        print("Error: 처리할 데이터가 없습니다. 파일 경로와 컬럼명을 다시 확인해주세요.")
-        return
-
+        except: pass
+    
     full_df = pd.concat(dfs, ignore_index=True)
-    print(f"-> 전체 데이터 병합 완료: {len(full_df)} 행")
+    
+    # 전처리: TTP 결측 제거 및 포맷팅
+    full_df = full_df.dropna(subset=[ttp_col])
+    full_df[ttp_col] = full_df[ttp_col].astype(str).str.strip()
+    full_df = full_df[full_df[ttp_col].str.startswith('T')] # TTP 포맷 필터링
 
-    # 3. 데이터 전처리
-    print("--- 3. 데이터 전처리 (결측치 제거 및 정렬) ---")
+    # 시간 변환 및 정렬
+    full_df[ts_col] = pd.to_datetime(full_df[ts_col], unit='s', errors='coerce').fillna(pd.to_datetime(full_df[ts_col], errors='coerce'))
+    full_df = full_df.sort_values(by=[src_ip_col, ts_col])
     
-    # [수정] label_technique 컬럼 사용
-    # TTP 레이블이 없는 행(일반 트래픽 등) 제거
-    full_df = full_df.dropna(subset=['label_technique'])
-    
-    # TTP ID 포맷 클렌징 (문자열 변환, 공백 제거)
-    full_df['label_technique'] = full_df['label_technique'].astype(str).str.strip()
-    
-    # 'T'로 시작하는 유효한 TTP ID만 남김 (예: 'T1059') - 데이터에 따라 조절 가능
-    full_df = full_df[full_df['label_technique'].str.startswith('T')]
-    
-    # [수정] ts 컬럼 기준 정렬
-    # ts가 float(Unix timestamp)일 수도 있고 datetime일 수도 있으므로 변환 시도
-    if 'ts' in full_df.columns:
-        full_df['ts'] = pd.to_datetime(full_df['ts'], unit='s', errors='coerce').fillna(pd.to_datetime(full_df['ts'], errors='coerce'))
-        # 소스 IP별로, 시간 순서대로 정렬
-        full_df = full_df.sort_values(by=['src_ip_zeek', 'ts'])
-    else:
-        print("Warning: 'ts' 컬럼 처리 중 문제가 발생했습니다. 정렬이 부정확할 수 있습니다.")
+    print(f"-> 전처리 완료 데이터: {len(full_df)} 행")
 
-    # 4. 시퀀스 추출 (Grouping)
-    print("--- 4. TTP 시퀀스 생성 중... ---")
-    sequences = []
+    # ---------------------------------------------------------
+    # [핵심] 3. 시간 기반 세션 분리 (Time-based Sessionization)
+    # ---------------------------------------------------------
+    print(f"--- 3. 세션 분리 (기준: {time_threshold_minutes}분) ---")
     
-    # [수정] src_ip_zeek(공격자 IP) 기준으로 그룹화하여 TTP 리스트 생성
-    # -> "동일 IP에서 발생한 일련의 공격 행위"를 하나의 시퀀스로 간주
-    grouped = full_df.groupby('src_ip_zeek')['label_technique'].apply(list)
+    # IP별로 이전 로그와의 시간 차이 계산
+    # diff()는 바로 앞 행과의 차이를 구함
+    full_df['time_diff'] = full_df.groupby(src_ip_col)[ts_col].diff()
     
-    for src_ip, ttp_list in tqdm(grouped.items(), desc="시퀀스 변환"):
-        # (선택사항) 연속된 중복 TTP 제거가 필요하면 아래 주석 해제
-        # ttp_list = [k for k, g in itertools.groupby(ttp_list)]
+    # 시간 차이가 임계값(30분)보다 크면 '새로운 세션(True)'으로 마킹
+    # pd.Timedelta로 분 단위 변환
+    threshold = pd.Timedelta(minutes=time_threshold_minutes)
+    full_df['is_new_session'] = full_df['time_diff'] > threshold
+    full_df['is_new_session'] = full_df['is_new_session'].fillna(False) # 첫 행 처리
+
+    # 누적 합(cumsum)을 이용해 세션 ID 생성
+    # 예: [False, False, True, False] -> [0, 0, 1, 1]
+    # IP별로 독립적인 세션 ID를 만들기 위해 IP + Session_Num 조합 사용
+    full_df['session_id_local'] = full_df.groupby(src_ip_col)['is_new_session'].cumsum()
+    
+    # 최종 그룹화: [IP, Session_ID]
+    grouped = full_df.groupby([src_ip_col, 'session_id_local'])[ttp_col].apply(list)
+    
+    print(f"-> 분리된 총 세션(공격) 수: {len(grouped)}")
+
+    # ---------------------------------------------------------
+    # [핵심] 4. 슬라이딩 윈도우 & 중복 제거 (Sliding Window)
+    # ---------------------------------------------------------
+    print(f"--- 4. 슬라이딩 윈도우 적용 (Size: {window_size}, Stride: {stride}) ---")
+    
+    final_sequences = []
+    
+    import itertools
+
+    for _, ttp_list in tqdm(grouped.items(), desc="시퀀스 가공"):
+        # 1) 연속 중복 제거 (Dedup)
+        # [A, A, B, B, B, A] -> [A, B, A]
+        clean_list = [k for k, g in itertools.groupby(ttp_list)]
         
-        if len(ttp_list) >= min_sequence_length:
-            sequences.append(ttp_list)
+        # 길이가 너무 짧으면 패스
+        if len(clean_list) < 2:
+            continue
+            
+        # 2) 슬라이딩 윈도우 (Sliding Window)
+        # 긴 시퀀스를 모델 입력 크기에 맞춰 여러 개로 쪼갬
+        if len(clean_list) <= window_size:
+            # 윈도우보다 짧으면 그냥 통째로 추가
+            final_sequences.append(clean_list)
+        else:
+            # 윈도우보다 길면 잘라서 추가
+            # 예: 길이 100 -> 0~20, 5~25, 10~30 ...
+            for i in range(0, len(clean_list) - window_size + 1, stride):
+                window = clean_list[i : i + window_size]
+                final_sequences.append(window)
 
-    print(f"-> 추출된 유효 시퀀스 수: {len(sequences)}")
-    if sequences:
-        print(f"-> 예시 시퀀스 (첫 번째 IP의 공격 흐름): {sequences[0]}")
+    print(f"-> 최종 생성된 시퀀스 개수: {len(final_sequences)}")
+    if final_sequences:
+        print(f"-> 예시: {final_sequences[0]}")
 
-    # 5. 저장
-    print(f"--- 5. 파일 저장: {output_file} ---")
+    # 저장
     with open(output_file, 'w', encoding='utf-8') as f:
-        json.dump(sequences, f, indent=2)
-    print("완료!")
+        json.dump(final_sequences, f, indent=2)
+    print(f"--- 완료! 저장됨: {output_file} ---")
 
-# --- 실행부 ---
 if __name__ == "__main__":
-    # UWF-ZeekData24의 Parquet 파일이 있는 폴더 경로를 지정하세요.
-    INPUT_DIR = "./data/uwf_zeekdata24" 
-    OUTPUT_FILE = "uwf_real_sequences.json"
+    # 설정값
+    INPUT_DIR = "data/uwf_zeekdata24"
+    OUTPUT_FILE = "uwf_smart_sequences.json"
     
-    process_uwf_zeekdata_parquet(INPUT_DIR, OUTPUT_FILE)
+    # 30분 이상 쉬면 다른 공격으로 간주, 윈도우 크기는 10~20 추천
+    process_uwf_smartly(
+        INPUT_DIR, 
+        OUTPUT_FILE, 
+        time_threshold_minutes=30, 
+        window_size=20, 
+        stride=5
+    )
